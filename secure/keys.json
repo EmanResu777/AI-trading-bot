@@ -1,0 +1,13 @@
+{
+    "api_key": "YOUR_BINANCE_API_KEY",
+    "api_secret": "YOUR_BINANCE_API_SECRET",
+    "telegram_token": "YOUR_TELEGRAM_BOT_TOKEN",
+    "chat_id": "YOUR_TELEGRAM_CHAT_ID",
+    "trading_pairs": ["BTCUSDT", "ETHUSDT", "ADAUSDT"],
+    "liquidity_threshold": 500,
+    "volatility_threshold": 0.005,
+    "consecutive_loss_threshold": 4,
+    "retraining_cooldown_period_hours": 12,
+    "cumulative_pnl_check_trades": 15,
+    "cumulative_pnl_threshold": -75.0
+}

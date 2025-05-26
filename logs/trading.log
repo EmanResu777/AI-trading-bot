@@ -1,0 +1,4 @@
+2025-05-26 04:57:22,530 - INFO - main.py:32 - Logging setup complete.
+2025-05-26 04:57:22,539 - DEBUG - main.py:33 - This is a debug message.
+2025-05-26 04:57:22,539 - WARNING - main.py:34 - This is a warning.
+2025-05-26 04:57:22,539 - ERROR - main.py:35 - This is an error.
