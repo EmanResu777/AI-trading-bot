@@ -33,6 +33,11 @@ from torch import nn
 # from data.processor import DataProcessor
 # from sentiment.finbert import SentimentAnalyzer
 
+# --- Imports for Trading Signal RL Integration ---
+from trading_signal_env import TradingSignalEnv # For the new signal RL model's environment
+from train_trading_signal_rl import StaticHistoricalDataProvider # For dummy env instantiation if needed for loading signal model
+# --- End Imports for Trading Signal RL Integration ---
+
 # Placeholder classes if the actual files are empty for now
 class DataProcessor:
     """
@@ -201,30 +206,58 @@ class KeyManager:
     def __init__(self):
         self.keys_file = "secure/keys.json"
         os.makedirs(os.path.dirname(self.keys_file), exist_ok=True)
-
+        self.default_news_config = { 
+            "news_fetch_enabled": False,
+            "sources": [
+                {"name": "NewsAPI", "api_key": "YOUR_NEWSAPI_KEY_DEFAULT", "enabled": False, "coins_supported": ["BTC", "ETH"]},
+                {"name": "CryptoPanic", "api_key": "YOUR_CRYPTOPANIC_KEY_DEFAULT", "enabled": False, "coins_supported": ["general"]}
+            ]
+        }
+        self.default_keys = { 
+            "api_key": "DEFAULT_API_KEY",
+            "api_secret": "DEFAULT_API_SECRET",
+            "telegram_token": "DEFAULT_TELEGRAM_TOKEN",
+            "chat_id": "DEFAULT_CHAT_ID",
+            "trading_pairs": ["BTCUSDT", "ETHUSDT"],
+            "news_api_config": self.default_news_config, 
+            "max_risk_per_trade": 0.01, 
+            "retraining_cooldown_period_hours": 24,
+            "consecutive_loss_threshold": 3,
+            "cumulative_pnl_check_trades": 10,
+            "cumulative_pnl_threshold": -50.0,
+            "liquidity_threshold": 300,
+            "volatility_threshold": 0.01,
+            "signal_rl_training_steps": 50000,
+            # Portfolio Drawdown Keys
+            "max_portfolio_drawdown_limit": 0.10, # Max 10% drawdown
+            "portfolio_drawdown_check_interval_hours": 24, # Check every 24 hours
+            "portfolio_initial_value_source": "current_on_start", # "current_on_start" or "fixed_amount_from_keys"
+            "portfolio_fixed_initial_value_usdt": 10000.0 # Used if source is "fixed_amount_from_keys"
+        }
 
     def load_keys(self) -> dict:
         """
         Loads keys and configuration from the JSON file.
         Provides default values for any missing keys to ensure robustness.
+        Ensures 'news_api_config' exists with a default structure if missing.
 
         Returns:
             dict: A dictionary containing the loaded keys and configuration.
         """
         try:
             with open(self.keys_file, "r", encoding="utf-8") as f:
-                return json.load(f)
+                loaded_json = json.load(f)
+                # Ensure all default keys are present using setdefault
+                for key, default_value in self.default_keys.items():
+                    if key == "news_api_config": # Special handling for nested dict
+                        loaded_json.setdefault(key, default_value.copy()) # Use a copy for the nested dict
+                    else:
+                        loaded_json.setdefault(key, default_value)
+                return loaded_json
         except (OSError, json.JSONDecodeError) as e:
-            logger.error(f"Error loading keys from {self.keys_file}: {e}")
-            # Return a default structure if file is missing or corrupt to allow bot to potentially proceed or alert user
-            return {
-                "api_key": "DEFAULT_API_KEY",
-                "api_secret": "DEFAULT_API_SECRET",
-                "telegram_token": "DEFAULT_TELEGRAM_TOKEN",
-                "chat_id": "DEFAULT_CHAT_ID",
-                "trading_pairs": ["BTCUSDT", "ETHUSDT"]
-            }
-
+            logger.error(f"Error loading keys from {self.keys_file}: {e}. Returning default structure.")
+            # Return a deep copy of the default structure
+            return {k: (v.copy() if isinstance(v, dict) else v) for k, v in self.default_keys.items()}
 
     def save_keys(self, keys: dict) -> None:
         try:
@@ -241,6 +274,53 @@ class KeyManager:
             current_pairs = []
         keys["trading_pairs"] = list(set(current_pairs + pairs))
         self.save_keys(keys)
+
+    def update_news_api_source(self, source_name: str, api_key: str, enabled: bool, coins_supported: list[str] = None) -> bool:
+        """
+        Updates the API key, enabled status, and optionally coins_supported for a news source.
+        If the source doesn't exist, it can be added (though current logic focuses on updates).
+
+        Args:
+            source_name (str): The name of the news source (e.g., "NewsAPI").
+            api_key (str): The new API key.
+            enabled (bool): The new enabled status.
+            coins_supported (list[str], optional): List of coins this source supports. If None, not updated.
+
+
+        Returns:
+            bool: True if update was successful, False otherwise.
+        """
+        keys = self.load_keys()
+        news_config = keys.get("news_api_config") # Already defaults in load_keys
+
+        if not news_config or "sources" not in news_config:
+            logger.error("news_api_config or sources list is missing. Cannot update source.")
+            return False # Should not happen if load_keys works correctly
+
+        source_found = False
+        for source in news_config["sources"]:
+            if source.get("name") == source_name:
+                source["api_key"] = api_key
+                source["enabled"] = enabled
+                if coins_supported is not None: # Only update if provided
+                    source["coins_supported"] = coins_supported
+                source_found = True
+                logger.info(f"Updated news source '{source_name}': enabled={enabled}, coins_supported={coins_supported if coins_supported is not None else 'not changed'}.")
+                break
+        
+        if not source_found:
+            # Optionally add new source if not found
+            logger.warning(f"News source '{source_name}' not found. To add, implement source addition logic.")
+            # Example for adding:
+            # news_config["sources"].append({
+            #     "name": source_name, "api_key": api_key, "enabled": enabled, 
+            #     "coins_supported": coins_supported if coins_supported is not None else ["general"]
+            # })
+            # logger.info(f"Added new news source '{source_name}'.")
+            return False # For now, only update existing
+
+        self.save_keys(keys)
+        return True
 
 class TradingBot:
     """Автономный торговый бот с самообучением и расширенными индикаторами."""
@@ -278,6 +358,9 @@ class TradingBot:
         self.executor = ThreadPoolExecutor(max_workers=8)
         self.idle_notification_sent = False # Flag for idle notification
 
+        # For Trading Signal RL Model
+        self.signal_env: TradingSignalEnv = None # Will be initialized if needed for model loading
+
         # Sentiment Thresholds
         self.sentiment_strong_positive_threshold = 0.6
         self.sentiment_strong_negative_threshold = -0.6
@@ -295,8 +378,21 @@ class TradingBot:
         self.cumulative_pnl_threshold = self.keys.get("cumulative_pnl_threshold", -50.0)
         
         # Liquidity and Volatility Thresholds from keys.json
-        self.liquidity_threshold = self.keys.get("liquidity_threshold", 300) # Default 300 USDT
-        self.volatility_threshold = self.keys.get("volatility_threshold", 0.01) # Default 1%
+        self.liquidity_threshold = self.keys.get("liquidity_threshold", self.default_keys["liquidity_threshold"])
+        self.volatility_threshold = self.keys.get("volatility_threshold", self.default_keys["volatility_threshold"])
+        self.max_risk_per_trade = self.keys.get("max_risk_per_trade", self.default_keys["max_risk_per_trade"])
+        
+        # Portfolio Drawdown Config
+        self.max_portfolio_drawdown_limit = self.keys.get("max_portfolio_drawdown_limit", self.default_keys["max_portfolio_drawdown_limit"])
+        self.portfolio_drawdown_check_interval_hours = self.keys.get("portfolio_drawdown_check_interval_hours", self.default_keys["portfolio_drawdown_check_interval_hours"])
+        self.portfolio_initial_value_source = self.keys.get("portfolio_initial_value_source", self.default_keys["portfolio_initial_value_source"])
+        self.portfolio_fixed_initial_value_usdt = self.keys.get("portfolio_fixed_initial_value_usdt", self.default_keys["portfolio_fixed_initial_value_usdt"])
+
+        # Portfolio Drawdown State Variables
+        self.initial_portfolio_value_usdt = 0.0
+        self.last_drawdown_check_time = None # Will be set after portfolio value initialization
+        self.trading_paused_due_to_drawdown = False
+
 
     def _load_keys_and_models(self) -> None:
         """Загрузить API‑ключи, подключиться к Binance, Telegram и загрузить модели."""
@@ -740,19 +836,55 @@ class TradingBot:
             # Replicating original behavior for now. This part might need significant review for correctness.
             
             t2 = torch.tensor(d2_windowed, dtype=torch.float32).unsqueeze(0).to(device)
-            logger.info(f"Processing Bayesian LSTM for {pair}. Input shape: {t2.shape}. (Note: Original training loop was minimal)")
+            # logger.info(f"Processing Bayesian LSTM for {pair}. Input shape: {t2.shape}. (Note: Original training loop was minimal)") # Old log
 
-            for _ in range(50): # As per original code
-                m2(t2) # Forward pass
-            
-            os.makedirs("./saved_models/", exist_ok=True)
-            torch.save(m2.state_dict(), f"./saved_models/{pair}_bayesian_lstm.pt")
-            self.models[pair]["bayesian_lstm"] = m2
-            logger.info(f"Bayesian LSTM model for {pair} processed and saved.")
-            await self.send_notification(f"👍 Bayesian LSTM model for {pair} 'trained' (processed) and saved.")
-        else:
+            # --- Proper Training Loop for BayesianLSTM ---
+            opt_bayes = torch.optim.Adam(m2.parameters(), lr=0.001)
+            loss_fn_bayes = torch.nn.MSELoss()
+
+            # Target preparation for BayesianLSTM
+            # Assuming the target is the most recent 'close' price, similar to LSTMModel.
+            # This should ideally align with the end of the 'd2_windowed' sequence.
+            if len(df["close"]) > bayesian_window_size: # Ensure there's a valid target beyond the window if predicting next step
+                                                       # Or, at least enough data to correspond to the window's end.
+                                                       # For using df["close"].values[-1], this check is more about data availability.
+                target_val_bayes = df["close"].values[-1] # Using the last known close as target
+                tgt_bayes = torch.tensor(target_val_bayes, dtype=torch.float32).unsqueeze(0).to(device)
+
+                logger.info(f"Training Bayesian LSTM for {pair}. Input shape: {t2.shape}, Target value: {target_val_bayes}")
+                m2.train() # Set model to training mode
+                for epoch in range(100): # Number of epochs (e.g., 100)
+                    opt_bayes.zero_grad()
+                    out_bayes = m2(t2) # out_bayes shape should be [1, 1]
+                    loss_bayes = loss_fn_bayes(out_bayes.squeeze(), tgt_bayes.squeeze()) # Squeeze to match shapes
+                    loss_bayes.backward()
+                    opt_bayes.step()
+                    if (epoch + 1) % 20 == 0:
+                        logger.debug(f"Bayesian LSTM {pair} Epoch {epoch+1}, Loss: {loss_bayes.item()}")
+                
+                os.makedirs("./saved_models/", exist_ok=True)
+                torch.save(m2.state_dict(), f"./saved_models/{pair}_bayesian_lstm.pt")
+                logger.info(f"Bayesian LSTM model for {pair} trained and saved.")
+                await self.send_notification(f"👍 Bayesian LSTM model for {pair} trained and saved.")
+            else:
+                logger.warning(f"Not enough data points in df[close] for target selection for Bayesian LSTM on {pair} (need > {bayesian_window_size}, have {len(df['close'])}). Skipping Bayesian LSTM training.")
+                await self.send_notification(f"📉 Not enough data for Bayesian LSTM target for {pair}. Training skipped.")
+                # Ensure model is not assigned if not trained
+                if "bayesian_lstm" in self.models.get(pair, {}):
+                    del self.models[pair]["bayesian_lstm"] # Remove if it existed from a previous load attempt
+                return # Skip assigning this model if target prep failed
+
+            # os.makedirs("./saved_models/", exist_ok=True) # Moved inside if block
+            # torch.save(m2.state_dict(), f"./saved_models/{pair}_bayesian_lstm.pt") # Moved inside if block
+            self.models[pair]["bayesian_lstm"] = m2 # This assignment happens if training was successful
+            # logger.info(f"Bayesian LSTM model for {pair} processed and saved.") # Old log
+            # await self.send_notification(f"👍 Bayesian LSTM model for {pair} 'trained' (processed) and saved.") # Old notification
+        else: # This else corresponds to: if d2_full is not None and ...
             logger.warning(f"Could not prepare Bayesian LSTM input for {pair} or data shape mismatch. Expected features: {bayesian_input_features}, window: {bayesian_window_size}. Got: {d2_full.shape if d2_full is not None else 'None'}")
             await self.send_notification(f"📉 Failed to prepare/validate data for Bayesian LSTM training for {pair}.")
+            # Ensure model is not assigned if data prep failed
+            if "bayesian_lstm" in self.models.get(pair, {}):
+                 del self.models[pair]["bayesian_lstm"]
 
 
     async def _notify_performance_retraining(self, pair: str, reason: str) -> None:
@@ -1192,16 +1324,43 @@ class TradingBot:
             return np.zeros(self.env.observation_space.shape, dtype=np.float32)
 
 
-    async def execute_order(self, pair: str, side: str, qty_percent: float = 0.8) -> dict | None:
-        """Отправить маркет-ордер на Binance Futures. qty_percent is % of calculated max safe quantity."""
+    async def execute_order(self, pair: str, side: str, entry_price: float, stop_loss_price: float, is_closing_order: bool = False, quantity_to_close: float = 0.0) -> dict | None:
+        """
+        Sends a market order to Binance Futures. 
+        If is_closing_order is True, it closes the position with quantity_to_close.
+        Otherwise, it calculates position size based on risk parameters for a new entry.
+
+        Args:
+            pair (str): The trading pair symbol.
+            side (str): "BUY" or "SELL".
+            entry_price (float): The estimated entry price for the trade (for new entries).
+            stop_loss_price (float): The pre-calculated stop-loss price for this trade (for new entries).
+            is_closing_order (bool): If True, this order is to close an existing position.
+            quantity_to_close (float): The quantity to trade if this is a closing order.
+
+        Returns:
+            dict | None: The order response from Binance or None if order failed.
+        """
         try:
-            # Validate side
             if side.upper() not in ["BUY", "SELL"]:
                 logger.error(f"Invalid order side: {side} for {pair}.")
                 return None
 
-            # Get account balance info (make it more resilient)
-            balance_info = []
+            if not is_closing_order: # Validations for new entry orders
+                if entry_price <= 0:
+                    logger.error(f"Invalid entry_price: {entry_price} for {pair} {side} order. Must be positive.")
+                    return None
+                if side.upper() == "BUY" and (stop_loss_price <= 0 or stop_loss_price >= entry_price):
+                    logger.error(f"Invalid stop_loss_price: {stop_loss_price} for {pair} BUY order (entry: {entry_price}). SL must be below entry and positive.")
+                    return None
+                if side.upper() == "SELL" and (stop_loss_price <= 0 or stop_loss_price <= entry_price):
+                    logger.error(f"Invalid stop_loss_price: {stop_loss_price} for {pair} SELL order (entry: {entry_price}). SL must be above entry and positive.")
+                    return None
+            elif quantity_to_close <=0: # Validation for closing order
+                 logger.error(f"Invalid quantity_to_close: {quantity_to_close} for closing order on {pair} {side}.")
+                 return None
+
+
             try:
                 balance_info = await self.loop.run_in_executor(self.executor, self.client.futures_account_balance)
             except BinanceAPIException as e:
@@ -1226,88 +1385,123 @@ class TradingBot:
                 # await self.send_notification(f"💸 Low USDT balance: {usdt_balance:.2f}. Cannot trade {pair}.") # Emoji for money/balance
                 return None
 
-            # Get current price
-            price = 0.0
+            # Get account balance info
+            balance_info = []
             try:
-                ticker = await self.loop.run_in_executor(self.executor, lambda: self.client.get_symbol_ticker(symbol=pair))
-                price = float(ticker["price"])
+                balance_info = await self.loop.run_in_executor(self.executor, self.client.futures_account_balance)
             except BinanceAPIException as e:
-                logger.error(f"Binance API error fetching ticker for order on {pair}: {e}")
-                await self.send_notification(f"⚠️ Binance API error fetching price for {pair} order: {e.message}")
+                logger.error(f"Binance API error fetching balance for order on {pair}: {e}")
+                await self.send_notification(f"⚠️ Binance API error fetching balance for {pair} order: {e.message}")
                 return None
             except Exception as e:
-                logger.error(f"Unexpected error fetching ticker for order on {pair}: {e}")
-                await self.send_notification(f"⚠️ Unexpected error fetching price for {pair} order: {str(e)}")
+                logger.error(f"Unexpected error fetching balance for order on {pair}: {e}")
+                await self.send_notification(f"⚠️ Unexpected error fetching balance for {pair} order: {str(e)}")
                 return None
 
-            if price == 0.0:
-                logger.error(f"Price for {pair} is zero, cannot calculate quantity for order.")
-                return None
-
-
-            # Calculate quantity
-            # Original: qty = max(0.01, 14.20 * 0.8 / price) - this seems like a fixed USD amount (14.20 * 0.8)
-            # Let's make it more dynamic based on a small percentage of available balance and risk settings.
-            # Use a small portion of balance, e.g., 5% of USDT balance for this trade, adjusted by risk_factor.
-            # This is a simplified risk management for quantity. A full solution would use ATR for position sizing.
-            trade_value_usd = (usdt_balance * 0.05) / self.risk_factor # Smaller risk factor = larger position
-            quantity = trade_value_usd / price
+            usdt_balance = 0.0
+            if balance_info:
+                for asset_balance in balance_info:
+                    if asset_balance["asset"] == "USDT":
+                        usdt_balance = float(asset_balance.get("balance", 0.0))
+                        break
             
-            # Apply exchange quantity precision rules (requires fetching exchange info)
-            # For now, let's assume a generic precision or fetch it.
-            # This is a common failure point if not handled.
-            # Example: round to 3 decimal places for quantity for many pairs
+            if usdt_balance < 10.0: # Minimum threshold to trade
+                logger.warning(f"Insufficient USDT balance for {pair}: {usdt_balance:.2f} USDT. Minimum 10 USDT required.")
+                return None
+
+            # Get account balance info (needed for new entries, not strictly for closing existing with known quantity)
+            balance_info = []
+            usdt_balance = 0.0
+            if not is_closing_order: # Only fetch balance if it's a new entry requiring sizing
+                try:
+                    balance_info = await self.loop.run_in_executor(self.executor, self.client.futures_account_balance)
+                    if balance_info:
+                        for asset_balance in balance_info:
+                            if asset_balance["asset"] == "USDT":
+                                usdt_balance = float(asset_balance.get("balance", 0.0))
+                                break
+                    if usdt_balance < 10.0: 
+                        logger.warning(f"Insufficient USDT balance for new entry on {pair}: {usdt_balance:.2f} USDT. Min 10 USDT required.")
+                        return None
+                except BinanceAPIException as e_bal:
+                    logger.error(f"Binance API error fetching balance for order on {pair}: {e_bal}")
+                    await self.send_notification(f"⚠️ Binance API error fetching balance for {pair} order: {e_bal.message}")
+                    return None
+                except Exception as e_bal_gen:
+                    logger.error(f"Unexpected error fetching balance for order on {pair}: {e_bal_gen}")
+                    await self.send_notification(f"⚠️ Unexpected error fetching balance for {pair} order: {str(e_bal_gen)}")
+                    return None
+
+            quantity_to_trade = 0.0
+            log_price_sl_info = ""
+
+            if is_closing_order:
+                quantity_to_trade = quantity_to_close
+                logger.info(f"Preparing CLOSING order for {pair} {side}, Quantity: {quantity_to_trade:.8f}")
+            else: # New entry order, calculate size
+                risk_per_unit_in_quote = abs(entry_price - stop_loss_price)
+                if risk_per_unit_in_quote == 0:
+                    logger.error(f"Risk per unit is zero for {pair} {side} (entry: {entry_price}, SL: {stop_loss_price}). Cannot size position.")
+                    return None
+                max_loss_for_trade_usdt = usdt_balance * self.max_risk_per_trade
+                quantity_to_trade = max_loss_for_trade_usdt / risk_per_unit_in_quote
+                log_price_sl_info = f"(Entry: ~{entry_price:.4f}, SL: {stop_loss_price:.4f})"
+                logger.info(f"Position sizing for {pair} {side}: Balance={usdt_balance:.2f}, MaxRiskTrade={max_loss_for_trade_usdt:.2f}, RiskPerUnit={risk_per_unit_in_quote:.4f} -> Initial Quantity={quantity_to_trade:.8f}")
+
+            # Apply exchange quantity precision rules
             try:
                 exchange_info = await self.loop.run_in_executor(self.executor, lambda: self.client.get_exchange_info())
                 symbol_info = next(s for s in exchange_info['symbols'] if s['symbol'] == pair)
-                
                 lot_size_filter = next(f for f in symbol_info['filters'] if f['filterType'] == 'LOT_SIZE')
                 step_size = float(lot_size_filter['stepSize'])
-                
-                # Calculate quantity based on step_size
-                quantity = (quantity // step_size) * step_size
-
                 min_qty = float(lot_size_filter['minQty'])
-                if quantity < min_qty:
-                    logger.warning(f"Calculated quantity {quantity} for {pair} is below minQty {min_qty}. Cannot place order.")
-                    # await self.send_notification(f"⚠️ Calculated qty {quantity:.4f} for {pair} below min {min_qty:.4f}. Order skipped.")
-                    return None
 
+                quantity_to_trade = (quantity_to_trade // step_size) * step_size
+                quantity_to_trade = round(quantity_to_trade, 8) 
+
+                if quantity_to_trade < min_qty:
+                    context = "calculated new entry" if not is_closing_order else "closing"
+                    logger.warning(f"Quantity {quantity_to_trade:.8f} for {pair} ({context}) is below minQty {min_qty:.8f}. Cannot place order.")
+                    if not is_closing_order: # Only send notification for new entries failing this
+                        await self.send_notification(f"⚠️ Calc. qty {quantity_to_trade:.4f} for {pair} < min {min_qty:.4f}. Order skipped.")
+                    return None
             except Exception as e:
-                logger.error(f"Could not get exchange info or apply lot size for {pair}: {e}. Using default rounding for quantity.")
-                quantity = round(quantity, 3) # Fallback if exchange info fails
-                if quantity < 0.001: # Generic small quantity check
-                    logger.warning(f"Quantity too small for {pair} after fallback rounding: {quantity}")
+                logger.error(f"Could not get exchange info or apply lot size for {pair}: {e}. Using rough rounding.")
+                quantity_to_trade = round(quantity_to_trade, 3) 
+                if quantity_to_trade < 0.001: 
+                    logger.warning(f"Quantity too small for {pair} after fallback rounding: {quantity_to_trade}")
                     return None
-
-
-            if quantity <= 0:
-                logger.warning(f"Calculated quantity is zero or negative for {pair}. Order skipped.")
+            
+            if quantity_to_trade <= 0:
+                logger.warning(f"Final quantity is zero or negative for {pair} ({quantity_to_trade:.8f}). Order skipped.")
                 return None
 
-            logger.info(f"Attempting to {side} {quantity:.4f} of {pair} at market price ~{price:.2f}")
+            logger.info(f"Attempting to {side} {quantity_to_trade:.8f} of {pair} {log_price_sl_info if not is_closing_order else ''}")
+            
+            order_params = {"symbol": pair, "side": side.upper(), "type": "MARKET", "quantity": quantity_to_trade}
+            if is_closing_order:
+                order_params["reduceOnly"] = "true" # Ensure closing orders only reduce position
 
-            order = await self.loop.run_in_executor(
-                self.executor,
-                lambda: self.client.futures_create_order(
-                    symbol=pair, side=side.upper(), type="MARKET", quantity=quantity
-                )
-            )
+            order = await self.loop.run_in_executor(self.executor, lambda: self.client.futures_create_order(**order_params))
             
             order_id = order.get('orderId', 'N/A')
+            filled_price = float(order.get('avgPrice', entry_price if not is_closing_order else 0.0)) 
             logger.info(f"Executed {side} for {pair}: {order}")
-            # Use clearer emojis for buy/sell
             trade_emoji = "📈" if side.upper() == "BUY" else "📉"
-            await self.send_notification(f"{trade_emoji} TRADE: {side.upper()} {quantity:.4f} {pair} @ MKT ~{price:.2f}. OrderID: {order_id}")
+            action_type_msg = "CLOSING" if is_closing_order else "NEW"
             
-            # Store active position info
-            trade_data["active_positions"][pair] = {
-                "side": side.upper(),
-                "quantity": quantity,
-                "entry_price": price, # Approximate entry, actual filled price is in order details
-                "order_id": order.get("orderId"),
-                "timestamp": datetime.utcnow().isoformat()
-            }
+            if not is_closing_order:
+                await self.send_notification(f"{trade_emoji} {action_type_msg} TRADE: {side.upper()} {quantity_to_trade:.4f} {pair} @ MKT ~{filled_price:.4f} {log_price_sl_info}. OrderID: {order_id}")
+                trade_data["active_positions"][pair] = {
+                    "side": side.upper(), "quantity": quantity_to_trade,
+                    "entry_price": filled_price, "stop_loss_price": stop_loss_price,
+                    "order_id": order_id, "timestamp": datetime.utcnow().isoformat()
+                }
+            else: # It's a closing order
+                await self.send_notification(f"{trade_emoji} {action_type_msg} TRADE: {side.upper()} {quantity_to_trade:.4f} {pair} @ MKT ~{filled_price:.4f}. OrderID: {order_id}")
+                if pair in trade_data["active_positions"]: # Clear position from bot's tracking
+                    del trade_data["active_positions"][pair]
+                    logger.info(f"Cleared active position data for {pair} after closing order.")
             return order
 
         except BinanceAPIException as e:
@@ -1320,7 +1514,6 @@ class TradingBot:
             await self.send_notification(f"🚨 Unexpected Error on {side} {pair}: {str(e)}")
             await self.fix_code(f"Unexpected error execute_order {pair} {side}: {str(e)}", e)
             return None
-
 
     async def monitor_pnl_and_adjust_stops(self, pair: str) -> None:
         """Контролировать PnL, двигать трейлинг‑стоп + TP/SL, and check for retraining."""
@@ -1990,6 +2183,64 @@ class TradingBot:
 
         logger.info("Bot main loop has intentionally stopped or exited due to cancellation.")
         # "Bot stopped" notification is now sent from the main __name__ == "__main__" finally block for robustness.
+
+    async def _initialize_portfolio_value(self) -> None:
+        """Initializes the starting portfolio value based on configuration."""
+        self.logger.info(f"Initializing portfolio value. Source: '{self.portfolio_initial_value_source}'")
+        
+        if self.portfolio_initial_value_source == "fixed_amount_from_keys":
+            self.initial_portfolio_value_usdt = self.portfolio_fixed_initial_value_usdt
+            self.logger.info(f"Initial portfolio value set from fixed configuration: {self.initial_portfolio_value_usdt:.2f} USDT")
+        else: # Default to "current_on_start"
+            usdt_balance = 0.0
+            total_unrealized_pnl = 0.0
+
+            if not self.client:
+                self.logger.error("Binance client not initialized. Cannot fetch balance/positions for initial portfolio value.")
+                # Fallback to fixed amount if client is not available for "current_on_start"
+                self.initial_portfolio_value_usdt = self.portfolio_fixed_initial_value_usdt
+                await self.send_notification(f"⚠️ Client not ready for portfolio init. Using fixed value: {self.initial_portfolio_value_usdt:.2f} USDT.")
+                if self.initial_portfolio_value_usdt == 0:
+                     self.logger.warning("Initial portfolio value is zero (fixed value is zero or not set properly).")
+                return
+
+            try:
+                balance_info = await self.loop.run_in_executor(self.executor, self.client.futures_account_balance)
+                for asset_balance in balance_info:
+                    if asset_balance["asset"] == "USDT":
+                        usdt_balance = float(asset_balance.get("balance", 0.0))
+                        break
+                self.logger.info(f"Current USDT balance for portfolio init: {usdt_balance:.2f} USDT")
+            except BinanceAPIException as e:
+                self.logger.error(f"Binance API error fetching balance for initial portfolio value: {e}")
+                await self.send_notification(f"⚠️ Binance API error fetching balance for portfolio init: {e.message}. Using 0 balance for calc.")
+                usdt_balance = 0.0 # Default to 0 if fetch fails
+            except Exception as e:
+                self.logger.error(f"Unexpected error fetching balance for initial portfolio value: {e}", exc_info=True)
+                usdt_balance = 0.0
+
+            try:
+                positions = await self.loop.run_in_executor(self.executor, self.client.futures_position_information)
+                for pos in positions:
+                    total_unrealized_pnl += float(pos.get("unRealizedProfit", 0.0))
+                self.logger.info(f"Total unrealized PNL from open positions: {total_unrealized_pnl:.2f} USDT")
+            except BinanceAPIException as e:
+                self.logger.error(f"Binance API error fetching positions for initial portfolio value: {e}")
+                await self.send_notification(f"⚠️ Binance API error fetching positions for portfolio init: {e.message}. Using 0 PNL for calc.")
+                total_unrealized_pnl = 0.0 # Default to 0 if fetch fails
+            except Exception as e:
+                self.logger.error(f"Unexpected error fetching positions for initial portfolio value: {e}", exc_info=True)
+                total_unrealized_pnl = 0.0
+            
+            self.initial_portfolio_value_usdt = usdt_balance + total_unrealized_pnl
+            self.logger.info(f"Initial portfolio value calculated as 'current_on_start': {self.initial_portfolio_value_usdt:.2f} USDT (Balance: {usdt_balance:.2f} + UnrealizedPNL: {total_unrealized_pnl:.2f})")
+
+        if self.initial_portfolio_value_usdt <= 0:
+            self.logger.warning(f"Initial portfolio value is {self.initial_portfolio_value_usdt:.2f} USDT. Drawdown monitoring might behave unexpectedly if this is not intended.")
+            await self.send_notification(f"⚠️ Initial portfolio value is {self.initial_portfolio_value_usdt:.2f} USDT. Drawdown limits may trigger if this is not intended.")
+        else:
+            await self.send_notification(f"💰 Initial portfolio value set to: {self.initial_portfolio_value_usdt:.2f} USDT. Drawdown limit: {self.max_portfolio_drawdown_limit*100:.1f}%.")
+
 
     async def _process_single_pair(self, pair_symbol: str) -> None:
         """
